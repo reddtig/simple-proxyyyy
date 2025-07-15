@@ -1,79 +1,65 @@
-import { setResponseHeaders } from 'h3';
-import { getCachedSegment } from './m3u8-proxy';
+export default {
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
 
-// Check if caching is disabled via environment variable
-const isCacheDisabled = () => process.env.DISABLE_CACHE === 'true';
+    // Construct the target backend URL by forwarding the path and query
+    const targetURL = `https://server.fifthwit.net${url.pathname}${url.search}`;
 
-export default defineEventHandler(async (event) => {
-  // Handle CORS preflight requests
-  if (isPreflightRequest(event)) return handleCors(event, {});
-  
-  const url = getQuery(event).url as string;
-  const headersParam = getQuery(event).headers as string;
-  
-  if (!url) {
-    return sendError(event, createError({
-      statusCode: 400,
-      statusMessage: 'URL parameter is required'
-    }));
-  }
-  
-  let headers = {};
-  try {
-    headers = headersParam ? JSON.parse(headersParam) : {};
-  } catch (e) {
-    return sendError(event, createError({
-      statusCode: 400,
-      statusMessage: 'Invalid headers format'
-    }));
-  }
-  
-  try {
-    // Only check cache if caching is enabled
-    if (!isCacheDisabled()) {
-      const cachedSegment = getCachedSegment(url);
-      
-      if (cachedSegment) {
-        setResponseHeaders(event, {
-          'Content-Type': cachedSegment.headers['content-type'] || 'video/mp2t',
+    const cache = caches.default;
+    const cacheKey = new Request(targetURL, request);
+
+    // Try serving from Cloudflare edge cache
+    const cachedResponse = await cache.match(cacheKey);
+    if (cachedResponse) {
+      return new Response(cachedResponse.body, {
+        status: cachedResponse.status,
+        statusText: cachedResponse.statusText,
+        headers: {
+          ...Object.fromEntries(cachedResponse.headers),
           'Access-Control-Allow-Origin': '*',
           'Access-Control-Allow-Headers': '*',
-          'Access-Control-Allow-Methods': '*',
-          'Cache-Control': 'public, max-age=3600' // Allow caching of TS segments
-        });
-        
-        return cachedSegment.data;
-      }
+          'Access-Control-Allow-Methods': 'GET, OPTIONS',
+          'Cache-Control': 'public, max-age=3600',
+        },
+      });
     }
-    
-    const response = await globalThis.fetch(url, {
-      method: 'GET',
-      headers: {
-        // Default User-Agent (from src/utils/headers.ts)
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:93.0) Gecko/20100101 Firefox/93.0',
-        ...(headers as HeadersInit),
-      }
+
+    // Fetch from origin backend
+    const backendResponse = await fetch(targetURL, {
+      method: request.method,
+      headers: request.headers,
+      redirect: 'follow',
+      cf: {
+        cacheEverything: true, // Enable caching for all responses, even non-GET
+        cacheTtl: 3600,        // Cache for 1 hour at Cloudflare edge
+      },
     });
-    
-    if (!response.ok) {
-      throw new Error(`Failed to fetch TS file: ${response.status} ${response.statusText}`);
+
+    // If fetch failed, return error as-is
+    if (!backendResponse.ok) {
+      return backendResponse;
     }
-    
-    setResponseHeaders(event, {
-      'Content-Type': 'video/mp2t',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': '*',
-      'Access-Control-Allow-Methods': '*',
-      'Cache-Control': 'public, max-age=3600' // Allow caching of TS segments
+
+    // Create a new response streaming from the backend
+    const response = new Response(backendResponse.body, backendResponse);
+
+    // Set CORS and cache headers
+    const newHeaders = new Headers(response.headers);
+    newHeaders.set('Access-Control-Allow-Origin', '*');
+    newHeaders.set('Access-Control-Allow-Headers', '*');
+    newHeaders.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    newHeaders.set('Cache-Control', 'public, max-age=3600');
+
+    // Return response with new headers
+    const finalResponse = new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: newHeaders,
     });
-    
-    // Return the binary data directly
-    return new Uint8Array(await response.arrayBuffer());
-  } catch (error: any) {
-    console.error('Error proxying TS file:', error);
-    return sendError(event, createError({
-      statusCode: error.response?.status || 500,
-      statusMessage: error.message || 'Error proxying TS file'
-    }));
+
+    // Cache the response asynchronously (don't wait for cache put)
+    event.waitUntil(cache.put(cacheKey, finalResponse.clone()));
+
+    return finalResponse;
   }
-});
+};
